@@ -1,0 +1,138 @@
+import time
+import pandas as pd
+import pandas_ta as ta
+from binance.client import Client
+from binance.enums import *
+import logging
+
+# Konfigurasi logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class AsterDCABot:
+    def __init__(self, api_key, api_secret):
+        self.client = Client(api_key, api_secret)
+        self.symbol = 'ASTERUSDT'
+        self.leverage = 10
+        self.initial_balance = 100  # USDT
+        self.dca_levels = 3
+        self.dca_multiplier = 1.5
+        self.profit_target = 0.05  # 5%
+        
+        # Set leverage
+        self.client.futures_change_leverage(symbol=self.symbol, leverage=self.leverage)
+        
+    def get_klines(self, interval='5m', limit=100):
+        """Ambil data klines"""
+        klines = self.client.futures_klines(symbol=self.symbol, interval=interval, limit=limit)
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 
+                                          'close_time', 'quote_asset_volume', 'trades', 
+                                          'taker_buy_base', 'taker_buy_quote', 'ignore'])
+        df['close'] = pd.to_numeric(df['close'])
+        df['high'] = pd.to_numeric(df['high'])
+        df['low'] = pd.to_numeric(df['low'])
+        df['volume'] = pd.to_numeric(df['volume'])
+        return df
+    
+    def calculate_indicators(self, df):
+        """Hitung MA51, EMA13, EMA21"""
+        df['ma51'] = ta.sma(df['close'], length=51)
+        df['ema13'] = ta.ema(df['close'], length=13)
+        df['ema21'] = ta.ema(df['close'], length=21)
+        return df
+    
+    def get_position(self):
+        """Cek posisi saat ini"""
+        positions = self.client.futures_position_information(symbol=self.symbol)
+        for pos in positions:
+            if pos['symbol'] == self.symbol:
+                return float(pos['positionAmt'])
+        return 0
+    
+    def get_balance(self):
+        """Cek balance USDT"""
+        balance = self.client.futures_account_balance()
+        for asset in balance:
+            if asset['asset'] == 'USDT':
+                return float(asset['balance'])
+        return 0
+    
+    def place_long_order(self, quantity):
+        """Buka posisi long"""
+        try:
+            order = self.client.futures_create_order(
+                symbol=self.symbol,
+                side=SIDE_BUY,
+                type=ORDER_TYPE_MARKET,
+                quantity=quantity
+            )
+            logging.info(f"Long order placed: {quantity} {self.symbol}")
+            return order
+        except Exception as e:
+            logging.error(f"Error placing long order: {e}")
+            return None
+    
+    def place_dca_order(self, current_pos, current_price):
+        """DCA jika harga turun 2% dari average entry"""
+        positions = self.client.futures_position_information(symbol=self.symbol)
+        for pos in positions:
+            if pos['symbol'] == self.symbol and float(pos['positionAmt']) > 0:
+                entry_price = float(pos['entryPrice'])
+                if current_price < entry_price * 0.98:  # -2%
+                    dca_qty = abs(current_pos) * self.dca_multiplier
+                    self.place_long_order(dca_qty)
+                    logging.info(f"DCA order placed: {dca_qty}")
+    
+    def check_profit_withdraw(self):
+        """Auto withdraw jika profit 5%"""
+        balance = self.get_balance()
+        if balance >= self.initial_balance * (1 + self.profit_target):
+            profit = balance - self.initial_balance
+            withdraw_qty = profit * 0.9  # Withdraw 90% profit
+            # Uncomment untuk live withdraw
+            # withdraw = self.client.withdraw(asset='USDT', amount=withdraw_qty, address='YOUR_WITHDRAW_ADDRESS')
+            logging.info(f"Profit {profit:.2f} USDT detected! Ready to withdraw {withdraw_qty:.2f} USDT")
+            self.initial_balance = balance  # Reset target
+    
+    def trading_logic(self):
+        """Logika trading utama"""
+        while True:
+            try:
+                # Ambil data
+                df = self.get_klines()
+                df = self.calculate_indicators(df)
+                
+                current_price = df['close'].iloc[-1]
+                ma51 = df['ma51'].iloc[-1]
+                ema13 = df['ema13'].iloc[-1]
+                ema21 = df['ema21'].iloc[-1]
+                
+                position = self.get_position()
+                
+                # Signal BUY: EMA13 > EMA21 > MA51 (tren bullish)
+                if ema13 > ema21 > ma51 and position == 0:
+                    balance = self.get_balance()
+                    quantity = (balance * 0.1 / current_price)  # 10% balance
+                    self.place_long_order(quantity)
+                
+                # DCA logic
+                if position > 0:
+                    self.place_dca_order(position, current_price)
+                
+                # Check profit
+                self.check_profit_withdraw()
+                
+                logging.info(f"Price: {current_price:.4f} | MA51: {ma51:.4f} | EMA13: {ema13:.4f} | EMA21: {ema21:.4f} | Position: {position}")
+                
+                time.sleep(60)  # Check setiap 1 menit
+                
+            except Exception as e:
+                logging.error(f"Error in main loop: {e}")
+                time.sleep(30)
+
+# Penggunaan
+if __name__ == "__main__":
+    API_KEY = 'your_api_key_here'
+    API_SECRET = 'your_api_secret_here'
+    
+    bot = AsterDCABot(API_KEY, API_SECRET)
+    bot.trading_logic()
